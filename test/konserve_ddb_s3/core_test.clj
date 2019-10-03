@@ -157,3 +157,59 @@
     (testing "that we can dissoc"
       (sv/<?? sv/S (kp/-dissoc store :data))
       (is (nil? (sv/<?? sv/S (kp/-get-in store [:data])))))))
+
+(deftest test-nonatomic-keys
+  (testing "with non-atomic keys"
+    (let [store (async/<!! (empty-store {:region "us-west-2"
+                                         :table "nonatomic-ops"
+                                         :bucket "nonatomic-ops"
+                                         :s3-client *s3-client*
+                                         :ddb-client *ddb-client*
+                                         :consistent-key (constantly false)}))]
+      (testing "that looking up nonexistent values returns false"
+        (is (false? (async/<!! (kp/-exists? store :rabbit))))
+        (is (nil? (async/<!! (kp/-get-in store [:rabbit])))))
+      (testing "that we can assoc values"
+        (is (= [nil {:long 42
+                     :decimal 3.14159M
+                     :string "some characters"
+                     :vector [:foo :bar :baz/test]
+                     :map {:x 10 :y 10}
+                     :set #{:foo :bar :baz}}]
+               (sv/<?? sv/S (kp/-assoc-in store [:data] {:long 42
+                                                         :decimal 3.14159M
+                                                         :string "some characters"
+                                                         :vector [:foo :bar :baz/test]
+                                                         :map {:x 10 :y 10}
+                                                         :set #{:foo :bar :baz}})))))
+      (testing "that we cat get-in"
+        (is (= 42 (sv/<?? sv/S (kp/-get-in store [:data :long]))))
+        (is (= 3.14159M (sv/<?? sv/S (kp/-get-in store [:data :decimal]))))
+        (is (= "some characters" (sv/<?? sv/S (kp/-get-in store [:data :string]))))
+        (is (= [:foo :bar :baz/test] (sv/<?? sv/S (kp/-get-in store [:data :vector]))))
+        (is (= {:x 10 :y 10} (sv/<?? sv/S (kp/-get-in store [:data :map]))))
+        (is (= #{:foo :bar :baz} (sv/<?? sv/S (kp/-get-in store [:data :set]))))
+        (is (nil? (sv/<?? sv/S (kp/-get-in store [:data :rabbit])))))
+
+      (testing "that we can update-in"
+        (is (= [42 43] (sv/<?? sv/S (kp/-update-in store [:data :long] inc))))
+        (is (= 43 (sv/<?? sv/S (kp/-get-in store [:data :long]))))
+
+        (is (= [3.14159M 6.28318M] (sv/<?? sv/S (kp/-update-in store [:data :decimal] (partial * 2)))))
+        (is (= 6.28318M (sv/<?? sv/S (kp/-get-in store [:data :decimal]))))
+
+        (is (= ["some characters" "SOME CHARACTERS"] (sv/<?? sv/S (kp/-update-in store [:data :string] string/upper-case))))
+        (is (= "SOME CHARACTERS" (sv/<?? sv/S (kp/-get-in store [:data :string]))))
+
+        (is (= [[:foo :bar :baz/test] [:foo :bar :baz/test :quux]] (sv/<?? sv/S (kp/-update-in store [:data :vector] #(conj % :quux)))))
+        (is (= [:foo :bar :baz/test :quux] (sv/<?? sv/S (kp/-get-in store [:data :vector]))))
+
+        (is (= [{:x 10 :y 10} {:x 10 :y 10 :z 5}] (sv/<?? sv/S (kp/-update-in store [:data :map] #(assoc % :z 5)))))
+        (is (= {:x 10 :y 10 :z 5} (sv/<?? sv/S (kp/-get-in store [:data :map]))))
+
+        (is (= [#{:foo :bar :baz} #{:foo :bar}] (sv/<?? sv/S (kp/-update-in store [:data :set] #(disj % :baz)))))
+        (is (= #{:foo :bar} (sv/<?? sv/S (kp/-get-in store [:data :set])))))
+
+      (testing "that we can dissoc"
+        (sv/<?? sv/S (kp/-dissoc store :data))
+        (is (nil? (sv/<?? sv/S (kp/-get-in store [:data]))))))))

@@ -82,7 +82,8 @@
     (let [begin (.instant clock)]
       (sv/go-try sv/S
         (let [[k & ks] key-vec
-              value (let [s3k (if (consistent-key k)
+              consistent? (consistent-key k)
+              value (let [s3k (if consistent?
                                 (let [ek (encode-key dynamo-prefix k)
                                       response (async/<! (aws/invoke ddb-client {:op      :GetItem
                                                                                  :request {:TableName       table-name
@@ -111,7 +112,12 @@
                                                                             :request {:Bucket bucket-name
                                                                                       :Key    s3k}}))]
                               (log/debug {:task :s3-get-object :phase :end :key s3k :ms (ms clock begin)})
-                              (cond (s/valid? ::anomalies/anomaly response)
+                              (cond (and (not consistent?)
+                                         (s/valid? ::anomalies/anomaly response)
+                                         (= ::anomalies/not-found (::anomalies/category response)))
+                                    nil
+
+                                    (s/valid? ::anomalies/anomaly response)
                                     (ex-info "failed to read S3" {:error response})
 
                                     :else
@@ -211,7 +217,7 @@
                                                      [(get-in current-value ks) (get-in new-value ks)]))))))))))))]
               result)
             (let [ek (encode-key [s3-prefix \k] k)
-                  current-value (sv/<? sv/S (kp/-get-in this key-vec))
+                  current-value (sv/<? sv/S (kp/-get-in this [k]))
                   new-value (if (empty? ks)
                               (up-fn current-value)
                               (update-in current-value ks up-fn))
