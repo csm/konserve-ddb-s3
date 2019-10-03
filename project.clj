@@ -1,4 +1,4 @@
-(defproject com.github.csm/konserve-ddb-s3 "0.1.0-SNAPSHOT"
+(defproject com.github.csm/konserve-ddb-s3 "0.1.0-alpha1"
   :description "Konserve store atop DynamoDB and S3"
   :url "https://github.com/csm/konserve-ddb-s3"
   :license {:name "EPL-2.0 OR GPL-2.0-or-later WITH Classpath-exception-2.0"
@@ -12,18 +12,10 @@
                  [com.cognitect/anomalies "0.1.12"]
                  [org.lz4/lz4-java "1.6.0"]]
   :profiles {:test {:resource-paths ["test-resources"]
-                    ;:jvm-opts [~#(let [native-path (->> (leiningen.core.classpath/get-classpath %)
-                    ;                                    (clojure.core/filter (clojure.core/fn [p] (clojure.core/or (.endsWith p ".so") (.endsWith p ".dylib"))))
-                    ;                                    (clojure.core/map (clojure.core/fn [p] (.getPath (.getParentFile (clojure.java.io/file p)))))
-                    ;                                    (clojure.string/join \:)]
-                    ;               (leiningen.core.main/debug "computed native path" native-path)
-                    ;               (clojure.core/str "-Djava.library.path=" native-path)
-                    ;:jvm-opts ["-Dsqlite4java.debug=true"
-                    ;           "-Dsqlite4java.library.path=/Users/cmarshall/.m2/repository/com/almworks/sqlite4java/libsqlite4java-osx/1.0.392"
                     :dependencies [[ch.qos.logback/logback-classic "1.1.8"]
                                    [ch.qos.logback/logback-core "1.1.8"]
                                    [io.replikativ/superv.async "0.2.9"]
-                                   [s4 "0.1.2" :exclusions [org.clojure/tools.logging]]
+                                   [s4 "0.1.3" :exclusions [org.clojure/tools.logging]]
                                    [com.amazonaws/DynamoDBLocal "1.11.477"
                                     :exclusions [com.fasterxml.jackson.core/jackson-core
                                                  org.eclipse.jetty/jetty-client
