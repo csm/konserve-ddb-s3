@@ -483,7 +483,20 @@
 
   (-assoc-in [this ks v]
     (log/debug :task ::kp/-assoc-in :ks (pr-str ks))
-    (kp/-update-in this ks (constantly v)))
+    (if (or (some? (#{:db :ops} (first ks))) (< 1 (count ks)))
+      (kp/-update-in this ks (constantly v))
+      (let [_ (log/info :task :s3-put-object :phase :begin :key (first ks))
+            encoded-value (let [out (ByteArrayOutputStream.)]
+                            (kp/-serialize serializer out write-handlers v)
+                            (.toByteArray out))
+            s3-begin (.instant *clock*)
+            put-result (async/<! (aws/invoke s3-client {:op :PutObject
+                                                        :request {:Bucket bucket-name
+                                                                  :Key (str (first ks))
+                                                                  :Body encoded-value}}))]
+        (log/info :task :s3-put-object :phase :end :ms (ms s3-begin))
+        (when (anomaly? put-result)
+          (ex-info "failed to write to S3" {:error put-result})))))
 
   (-dissoc [this k]
     (async/go (UnsupportedOperationException. "not implemented")))
