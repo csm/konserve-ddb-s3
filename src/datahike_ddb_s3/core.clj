@@ -11,7 +11,8 @@
             [cognitect.aws.client.api.async :as aws]
             [konserve.protocols :as kp]
             [konserve.serializers :as ser]
-            [superv.async :as sv])
+            [superv.async :as sv]
+            [clojure.tools.logging :as log])
   (:import [java.util Base64]
            [java.io PushbackReader InputStreamReader ByteArrayInputStream ByteArrayOutputStream DataInputStream DataOutputStream Closeable]
            [com.google.common.io ByteStreams]
@@ -92,12 +93,12 @@
                        (if e
                          (let [k (key e)
                                v (val e)]
-                           (if-let [s3-address (if (map? v) (::s3-address v) v)]
+                           (if-let [s3-address (when (map? v) (::s3-address v))]
                              (let [value (sv/<? sv/S (kp/-get-in this [s3-address]))]
                                (recur es (assoc out k (kp/-deserialize serializer read-handlers (:Body value)))))
                              (recur es (assoc out k v))))
                          out)))]
-      {:value (get-in db-value ks)
+      {:value (when-not (empty? ddb-results) (get-in db-value ks))
        :rev   (-> ddb-results :Item :rev :N)})))
 
 (defrecord DynamoDB+S3Store [ddb-client s3-client table-name bucket-name serializer read-handlers write-handlers locks]
@@ -154,6 +155,7 @@
                      :else true)))))
 
   (-get-in [this ks]
+    (log/debug :task ::kp/-get-in :ks (pr-str ks))
     (sv/go-try sv/S
        (let [[k & ks] ks]
          (cond (= :db k)
@@ -219,17 +221,20 @@
 
   ; todo it would be nice to be able to append ops to the ops buffer in dynamodb. But for now we just swap in the new list.
   (-update-in [this ks f]
+    (log/debug :task ::kp/-update-in :ks (pr-str ks) :f f)
     (sv/go-try sv/S
       (let [[k1 k2 & ks] ks]
         (cond (= :db k1)
               (loop [backoff 100]
                 (let [{:keys [value rev]} (sv/<? sv/S (get-db-value this (some-> k2 vector)))
-                      new-value (update-in value (into (some-> k2 vector) ks) f)
+                      new-value (if (nil? k2)
+                                  (f value)
+                                  (update-in value (into (some-> k2 vector) ks) f))
                       ; todo do we want to store large items in S3? it may not be worth the effort.
                       update-result (if (nil? rev)
                                       (let [item (reduce-kv
                                                    (fn [m k v]
-                                                     (assoc m (encode-key k) {:B (let [out (ByteArrayInputStream.)]
+                                                     (assoc m (encode-key k) {:B (let [out (ByteArrayOutputStream.)]
                                                                                    (kp/-serialize serializer out write-handlers v)
                                                                                    (.toByteArray out))}))
                                                    {"k1" {:S "db"}
@@ -246,16 +251,21 @@
                                                                      (into {}))
                                                            "#rev" "rev")
                                             update-values (assoc (->> (map-indexed (fn [i k]
-                                                                                     [(str ":VALUE" i) {:B (let [out (ByteArrayInputStream.)]
-                                                                                                             (kp/-serialize serializer out write-handlers (get new-value k))
-                                                                                                             (.toByteArray out))}])
+                                                                                     [(str ":VALUE" i)
+                                                                                      {:B (let [out (ByteArrayOutputStream.)]
+                                                                                            (kp/-serialize serializer out write-handlers (get new-value k))
+                                                                                            (.toByteArray out))}])
                                                                                    (keys new-value))
                                                                       (into {}))
-                                                            ":oldrev" {:N rev})
+                                                            ":oldrev" {:N rev}
+                                                            ":newrev" {:N (-> (Long/parseLong rev) (unchecked-inc) str)})
                                             update-expression (str "SET "
                                                                    (string/join ", " (concat (map (fn [i] (str "#KEY" i " = :VALUE" i))
                                                                                                   (range (count (keys new-value))))
-                                                                                             "#rev = #rev + 1")))]
+                                                                                             ["#rev = :newrev"])))]
+                                        (log/debug :update-names (pr-str update-names)
+                                                   :update-values (pr-str update-values)
+                                                   :update-expression (pr-str update-expression))
                                         (async/<! (aws/invoke ddb-client {:op :UpdateItem
                                                                           :request {:TableName table-name
                                                                                     :Key {"k1" {:S "db"}
@@ -306,7 +316,7 @@
                                 new-value (if (empty? ks)
                                             (f value)
                                             (update-in value ks f))
-                                encoded-value (let [out (ByteArrayInputStream.)]
+                                encoded-value (let [out (ByteArrayOutputStream.)]
                                                 (kp/-serialize serializer out write-handlers new-value)
                                                 (.toByteArray out))
                                 update-result (if (nil? rev)
@@ -368,7 +378,9 @@
                       [(get-in value (into [k2] ks))
                        (get-in new-value (into [k2] ks))]))))))
 
-  (-assoc-in [this ks v] (kp/-update-in this ks (constantly v)))
+  (-assoc-in [this ks v]
+    (log/debug :task ::kp/-assoc-in :ks (pr-str ks) :v (pr-str v))
+    (kp/-update-in this ks (constantly v)))
 
   (-dissoc [this k]
     (async/go (UnsupportedOperationException. "not implemented")))
