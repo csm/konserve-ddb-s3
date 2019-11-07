@@ -209,7 +209,7 @@
                :else
                (let [result (async/<! (aws/invoke s3-client {:op :GetObject
                                                              :request {:Bucket bucket-name
-                                                                       :Key k}}))]
+                                                                       :Key (str k)}}))]
                  (cond (not-found? result)
                        nil
 
