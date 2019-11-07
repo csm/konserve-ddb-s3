@@ -416,12 +416,13 @@
                                                                                                :request {:TableName table-name
                                                                                                          :Key {"k1" {:S "ops"}
                                                                                                                "k2" {:S (str k2)}}
-                                                                                                         :UpdateExpression "SET #val = :val, #rev = #rev + 1"
-                                                                                                         :ConditionExpression "#rev = :rev"
+                                                                                                         :UpdateExpression "SET #val = :val, #rev = :newrev"
+                                                                                                         :ConditionExpression "#rev = :oldrev"
                                                                                                          :ExpressionAttributeNames {"#val" "val"
                                                                                                                                     "#rev" "rev"}
                                                                                                          :ExpressionAttributeValues {":val" {:B encoded-value}
-                                                                                                                                     ":rev" {:N rev}}}}))]
+                                                                                                                                     ":oldrev" {:N rev}
+                                                                                                                                     ":newrev" {:N (-> rev (Long/parseLong) (unchecked-inc) str)}}}}))]
                                                   (log/info :task :ddb-update-item :phase :end :ms (ms ddb-begin))
                                                   result))]
                             (cond (throttle? update-result)
