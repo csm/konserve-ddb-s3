@@ -16,7 +16,8 @@
   (:import [java.util Base64]
            [java.io PushbackReader InputStreamReader ByteArrayInputStream ByteArrayOutputStream DataInputStream DataOutputStream Closeable]
            [com.google.common.io ByteStreams]
-           [net.jpountz.lz4 LZ4Factory]))
+           [net.jpountz.lz4 LZ4Factory]
+           [java.time Clock Duration]))
 
 (defn anomaly?
   [result]
@@ -50,6 +51,26 @@
       (edn/read reader))
     (throw (ex-info "invalid key read from dynamodb" {:key k}))))
 
+(defn- nano-clock
+  ([] (nano-clock (Clock/systemUTC)))
+  ([clock]
+   (let [initial-instant (.instant clock)
+         initial-nanos (System/nanoTime)]
+     (proxy [Clock] []
+       (getZone [] (.getZone clock))
+       (withZone [zone] (nano-clock (.withZone clock zone)))
+       (instant [] (.plusNanos initial-instant (- (System/nanoTime) initial-nanos)))))))
+
+(def ^:dynamic *clock* (nano-clock))
+
+(defn- ms
+  ([begin] (ms *clock* begin))
+  ([clock begin]
+   (-> (Duration/between begin (.instant clock))
+       (.toNanos)
+       (double)
+       (/ 1000000.0))))
+
 (defprotocol IIndirect)
 
 (defrecord S3Address [address]
@@ -58,7 +79,9 @@
 (defn- get-db-value
   [{:keys [ddb-client table-name serializer read-handlers] :as this} ks]
   (sv/go-try sv/S
-    (let [[k & ks] ks
+    (log/debug :task ::get-db-value :phase :begin :ks ks)
+    (let [begin (.instant *clock*)
+          [k & ks] ks
           ddb-request (as-> {:TableName table-name
                              :ConsistentRead true
                              :Key {"k1" {:S "db"}
@@ -68,10 +91,14 @@
                               (assoc req :AttributesToGet ["rev" (encode-key k)])
                               req))
           ddb-results (loop [backoff 100]
-                        (let [response (async/<! (aws/invoke ddb-client {:op :GetItem
+                        (log/info :task :ddb-get-item :phase :begin :key (:Key ddb-request))
+                        (let [ddb-begin (.instant *clock*)
+                              response (async/<! (aws/invoke ddb-client {:op :GetItem
                                                                          :request ddb-request}))]
+                          (log/info :task :ddb-get-item :phase :end :ms (ms ddb-begin))
                           (cond (throttle? response)
                                 (do
+                                  (log/warn :task ::get-db-value :phase :ddb-throttle :ms (ms begin))
                                   (async/<! (async/timeout backoff))
                                   (recur (min 60000 (* 2 backoff))))
 
@@ -98,6 +125,7 @@
                                (recur es (assoc out k (kp/-deserialize serializer read-handlers (:Body value)))))
                              (recur es (assoc out k v))))
                          out)))]
+      (log/debug :task ::get-db-value :phase :end :ms (ms begin))
       {:value (when-not (empty? ddb-results) (get-in db-value ks))
        :rev   (-> ddb-results :Item :rev :N)})))
 
@@ -105,125 +133,160 @@
   kp/PEDNAsyncKeyValueStore
   (-exists? [_ key]
     (sv/go-try sv/S
-       (cond (= :db key) ; store db root metadata, op buffers in DynamoDB
-             (loop [backoff 100]
-               (let [response (async/<! (aws/invoke ddb-client {:op :GetItem
-                                                                :request {:TableName table-name
-                                                                          :Key {"k1" {:S "db"}
-                                                                                "k2" {:S "@ROOT"}}
-                                                                          :AttributesToGet ["k1" "k2"]}}))]
-                 (cond (throttle? response)
-                       (do
-                         (async/<! (async/timeout backoff))
-                         (recur (min 60000 (* 2 backoff))))
+      (log/debug :task ::kp/-exists? :phase :begin :key (pr-str key))
+      (let [begin (.instant *clock*)]
+        (cond (= :db key) ; store db root metadata, op buffers in DynamoDB
+              (loop [backoff 100]
+                (let [_ (log/info :task :ddb-get-item :phase :begin :key {"k1" {:S "db"} "k2" {:S "@ROOT"}})
+                      ddb-begin (.instant *clock*)
+                      response (async/<! (aws/invoke ddb-client {:op :GetItem
+                                                                 :request {:TableName table-name
+                                                                           :Key {"k1" {:S "db"}
+                                                                                 "k2" {:S "@ROOT"}}
+                                                                           :AttributesToGet ["k1" "k2"]}}))]
+                  (log/info :task :ddb-get-item :phase :end :ms (ms *clock* ddb-begin))
+                  (cond (throttle? response)
+                        (do
+                          (log/warn :task ::kp/-exists? :phase :ddb-throttle :ms (ms *clock* begin))
+                          (async/<! (async/timeout backoff))
+                          (recur (min 60000 (* 2 backoff))))
 
-                       (anomaly? response)
-                       (ex-info "failed to read DynamoDB" {:error response})
+                        (anomaly? response)
+                        (ex-info "failed to read DynamoDB" {:error response})
 
-                       :else (not (empty? response)))))
+                        :else
+                        (let [result (not (empty? response))]
+                          (log/info :task ::kp/-exists? :phase :end :key (pr-str key) :result (pr-str result) :ms (ms *clock* begin))
+                          result))))
 
-             (= :ops key)
-             (loop [backoff 100]
-               (let [response (async/<! (aws/invoke ddb-client {:op :Scan
-                                                                :request {:TableName table-name
-                                                                          :ExclusiveStartKey {"k1" {:S "ops"}
-                                                                                              "ks" {:S "0"}}
-                                                                          :ScanFilter {"k1" {:AttributeValueList [{:S ":ops"}]
-                                                                                             :ComparisonOperator "EQ"}}
-                                                                          :Limit 1}}))]
-                 (cond (throttle? response)
-                       (do
-                         (async/<! (async/timeout backoff))
-                         (recur (min 60000 (* 2 backoff))))
+              (= :ops key)
+              (loop [backoff 100]
+                (let [_ (log/info :task :ddb-scan :phase :begin :key {"k1" {:S "ops"} "ks" {:S "0"}})
+                      ddb-begin (.instant *clock*)
+                      response (async/<! (aws/invoke ddb-client {:op :Scan
+                                                                 :request {:TableName table-name
+                                                                           :ExclusiveStartKey {"k1" {:S "ops"}
+                                                                                               "ks" {:S "0"}}
+                                                                           :ScanFilter {"k1" {:AttributeValueList [{:S ":ops"}]
+                                                                                              :ComparisonOperator "EQ"}}
+                                                                           :Limit 1}}))]
+                  (log/info :task :ddb-scan :phase :end :ms (ms *clock* ddb-begin))
+                  (cond (throttle? response)
+                        (do
+                          (log/warn :task ::kp/-exists? :phase :ddb-throttle :ms (ms *clock* begin))
+                          (async/<! (async/timeout backoff))
+                          (recur (min 60000 (* 2 backoff))))
 
-                       (anomaly? response)
-                       (ex-info "failed to read DynamoDB" {:error response})
+                        (anomaly? response)
+                        (ex-info "failed to read DynamoDB" {:error response})
 
-                       :else
-                       (not (empty? (:Items response))))))
+                        :else
+                        (not (empty? (:Items response))))))
 
-             :else
-             (let [response (async/<! (aws/invoke s3-client {:op :HeadObject
-                                                             :request {:Bucket bucket-name
-                                                                       :Key (str key)}}))]
-               (cond (not-found? response)
-                     false
+              :else
+              (let [_ (log/info :task :s3-head-object :phase :begin :key (str key))
+                    s3-begin (.instant *clock*)
+                    response (async/<! (aws/invoke s3-client {:op :HeadObject
+                                                              :request {:Bucket bucket-name
+                                                                        :Key (str key)}}))]
+                (log/info :task :s3-head-object :phase :end :ms (ms *clock* s3-begin))
+                (cond (not-found? response)
+                      false
 
-                     (anomaly? response)
-                     (ex-info "failed to read S3" {:error response})
+                      (anomaly? response)
+                      (ex-info "failed to read S3" {:error response})
 
-                     :else true)))))
+                      :else true))))))
 
   (-get-in [this ks]
-    (log/debug :task ::kp/-get-in :ks (pr-str ks))
+    (log/debug :task ::kp/-get-in :phase :begin :ks (pr-str ks))
     (sv/go-try sv/S
-       (let [[k & ks] ks]
-         (cond (= :db k)
-               (:value (sv/<? sv/S (get-db-value this ks)))
+      (let [begin (.instant *clock*)
+            [k & ks] ks]
+        (cond (= :db k)
+              (:value (sv/<? sv/S (get-db-value this ks)))
 
-               (= :ops k)
-               (if (empty? ks)
-                 (let [scan-result (loop [backoff 100
-                                          start-key {"k1" {:S "ops"}
-                                                     "k2" {:S "0"}}
-                                          results []]
-                                     (let [result (async/<! (aws/invoke ddb-client {:op :Scan
-                                                                                    :request {:TableName table-name
-                                                                                              :ExclusiveStartKey start-key
-                                                                                              :ScanFilter {"k1" {:AttributeValueList [{:S "ops"}]
-                                                                                                                 :ComparisonOperator "EQ"}}}}))]
-                                       (cond (throttle? result)
-                                             (do
-                                               (async/<! (async/timeout backoff))
-                                               (recur (min 60000 (* 2 backoff)) start-key results))
+              (= :ops k)
+              (if (empty? ks)
+                (let [scan-result (loop [backoff 100
+                                         start-key {"k1" {:S "ops"}
+                                                    "k2" {:S "0"}}
+                                         results []]
+                                    (log/info :task :ddb-scan :phase :begin :start-key start-key)
+                                    (let [ddb-begin (.instant *clock*)
+                                          result (async/<! (aws/invoke ddb-client {:op :Scan
+                                                                                   :request {:TableName table-name
+                                                                                             :ExclusiveStartKey start-key
+                                                                                             :ScanFilter {"k1" {:AttributeValueList [{:S "ops"}]
+                                                                                                                :ComparisonOperator "EQ"}}}}))]
+                                      (log/info :task :ddb-scan :phase :end :ms (ms ddb-begin))
+                                      (cond (throttle? result)
+                                            (do
+                                              (log/warn :task ::kp/-get-in :phase :ddb-throttle :ms (ms begin))
+                                              (async/<! (async/timeout backoff))
+                                              (recur (min 60000 (* 2 backoff)) start-key results))
 
-                                             (anomaly? result)
-                                             (throw (ex-info "failed to read DynamoDB" {:error result}))
+                                            (anomaly? result)
+                                            (throw (ex-info "failed to read DynamoDB" {:error result}))
 
-                                             (some? (:LastEvaluatedKey result))
-                                             (recur 100 (:LastEvaluatedKey result)
-                                                    (into results (map (fn [item] [(-> item :k2 :S)
-                                                                                   (kp/-deserialize serializer read-handlers (-> item :val :B))]))))
+                                            (some? (:LastEvaluatedKey result))
+                                            (recur 100 (:LastEvaluatedKey result)
+                                                   (into results (map (fn [item] [(-> item :k2 :S)
+                                                                                  (kp/-deserialize serializer read-handlers (-> item :val :B))]))))
 
-                                             :else
-                                             (into {} results))))]
-                   scan-result)
-                 (let [[k & ks] ks
-                       item (loop [backoff 100]
-                              (let [result (async/<! (aws/invoke ddb-client {:op :GetItem
-                                                                             :request {:TableName table-name
-                                                                                       :Key {"k1" {:S "ops"}
-                                                                                             "k2" {:S (str k)}}}}))]
-                                (cond (throttle? result)
-                                      (do
-                                        (async/<! (async/timeout backoff))
-                                        (recur (min 60000 (* 2 backoff))))
+                                            :else
+                                            (into {} results))))]
+                  (log/debug :task ::kp/-get-in :phase :end :ms (ms begin))
+                  scan-result)
+                (let [[k & ks] ks
+                      item (loop [backoff 100]
+                             (log/info :task :ddb-get-item :phase :begin :key {"k1" {:S "ops"} "k2" {:S (str k)}})
+                             (let [ddb-begin (.instant *clock*)
+                                   result (async/<! (aws/invoke ddb-client {:op :GetItem
+                                                                            :request {:TableName table-name
+                                                                                      :Key {"k1" {:S "ops"}
+                                                                                            "k2" {:S (str k)}}}}))]
+                               (log/info :task :ddb-get-item :phase :end :ms (ms ddb-begin))
+                               (cond (throttle? result)
+                                     (do
+                                       (log/warn :task ::kp/-get-in :phase :ddb-throttle :ms (ms begin))
+                                       (async/<! (async/timeout backoff))
+                                       (recur (min 60000 (* 2 backoff))))
 
-                                      (anomaly? result)
-                                      (throw (ex-info "failed to read DynamoDB" {:error result}))
+                                     (anomaly? result)
+                                     (throw (ex-info "failed to read DynamoDB" {:error result}))
 
-                                      :else
-                                      (kp/-deserialize serializer read-handlers (-> result :Item :val :B)))))]
-                   (get-in item ks)))
+                                     :else
+                                     (kp/-deserialize serializer read-handlers (-> result :Item :val :B)))))]
+                  (log/debug :task ::kp/-get-in :phase :end :ms (ms begin))
+                  (get-in item ks)))
 
-               :else
-               (let [result (async/<! (aws/invoke s3-client {:op :GetObject
-                                                             :request {:Bucket bucket-name
-                                                                       :Key (str k)}}))]
-                 (cond (not-found? result)
-                       nil
+              :else
+              (let [_ (log/info :task :s3-get-object :phase :begin :key k)
+                    s3-begin (.instant *clock*)
+                    result (async/<! (aws/invoke s3-client {:op      :GetObject
+                                                            :request {:Bucket bucket-name
+                                                                      :Key    (str k)}}))]
+                (log/info :task :s3-get-object :phase :end :ms (ms s3-begin))
+                (cond (not-found? result)
+                      (do
+                        (log/debug :task ::kp/-get-in :phase :end :ms (ms begin))
+                        nil)
 
-                       (anomaly? result)
-                       (ex-info "failed to read S3" {:error result})
+                      (anomaly? result)
+                      (ex-info "failed to read S3" {:error result})
 
-                       :else
-                       (kp/-deserialize serializer read-handlers (:Body result))))))))
+                      :else
+                      (let [ret (kp/-deserialize serializer read-handlers (:Body result))]
+                        (log/debug :task ::kp/-get-in :phase :end :ms (ms begin))
+                        ret)))))))
 
   ; todo it would be nice to be able to append ops to the ops buffer in dynamodb. But for now we just swap in the new list.
   (-update-in [this ks f]
     (log/debug :task ::kp/-update-in :ks (pr-str ks) :f f)
     (sv/go-try sv/S
-      (let [[k1 k2 & ks] ks]
+      (let [begin (.instant *clock*)
+            [k1 k2 & ks] ks]
         (cond (= :db k1)
               (loop [backoff 100]
                 (let [{:keys [value rev]} (sv/<? sv/S (get-db-value this (some-> k2 vector)))
@@ -232,7 +295,8 @@
                                   (update-in value (into (some-> k2 vector) ks) f))
                       ; todo do we want to store large items in S3? it may not be worth the effort.
                       update-result (if (nil? rev)
-                                      (let [item (reduce-kv
+                                      (let [_ (log/info :task :ddb-put-item :phase :begin :key {"k1" {:S "db"} "k2" {:S "@ROOT"}})
+                                            item (reduce-kv
                                                    (fn [m k v]
                                                      (assoc m (encode-key k) {:B (let [out (ByteArrayOutputStream.)]
                                                                                    (kp/-serialize serializer out write-handlers v)
@@ -240,12 +304,16 @@
                                                    {"k1" {:S "db"}
                                                     "k2" {:S "@ROOT"}
                                                     "rev" {:N "0"}}
-                                                   new-value)]
-                                        (async/<! (aws/invoke ddb-client {:op :PutItem
-                                                                          :request {:TableName table-name
-                                                                                    :Item item
-                                                                                    :ConditionExpression "attribute_not_exists(k1) AND attribute_not_exists(k2)"}})))
-                                      (let [update-names (assoc (->> (map-indexed (fn [i k]
+                                                   new-value)
+                                            ddb-begin (.instant *clock*)
+                                            result (async/<! (aws/invoke ddb-client {:op :PutItem
+                                                                                     :request {:TableName table-name
+                                                                                               :Item item
+                                                                                               :ConditionExpression "attribute_not_exists(k1) AND attribute_not_exists(k2)"}}))]
+                                        (log/info :task :ddb-put-item :phase :end :ms (ms ddb-begin))
+                                        result)
+                                      (let [_ (log/info :task :ddb-update-item :phase :begin :key {"k1" {:S "db"} "k2" {:S "@ROOT"}})
+                                            update-names (assoc (->> (map-indexed (fn [i k]
                                                                                     [(str "#KEY" i) (encode-key k)])
                                                                                   (keys new-value))
                                                                      (into {}))
@@ -262,44 +330,55 @@
                                             update-expression (str "SET "
                                                                    (string/join ", " (concat (map (fn [i] (str "#KEY" i " = :VALUE" i))
                                                                                                   (range (count (keys new-value))))
-                                                                                             ["#rev = :newrev"])))]
-                                        (log/debug :update-names (pr-str update-names)
-                                                   :update-values (pr-str update-values)
-                                                   :update-expression (pr-str update-expression))
-                                        (async/<! (aws/invoke ddb-client {:op :UpdateItem
-                                                                          :request {:TableName table-name
-                                                                                    :Key {"k1" {:S "db"}
-                                                                                          "k2" {:S "@ROOT"}}
-                                                                                    :UpdateExpression update-expression
-                                                                                    :ExpressionAttributeNames update-names
-                                                                                    :ExpressionAttributeValues update-values
-                                                                                    :ConditionExpression "#rev = :oldrev"}}))))]
+                                                                                             ["#rev = :newrev"])))
+                                            ddb-begin (.instant *clock*)
+                                            result (async/<! (aws/invoke ddb-client {:op :UpdateItem
+                                                                                     :request {:TableName table-name
+                                                                                               :Key {"k1" {:S "db"}
+                                                                                                     "k2" {:S "@ROOT"}}
+                                                                                               :UpdateExpression update-expression
+                                                                                               :ExpressionAttributeNames update-names
+                                                                                               :ExpressionAttributeValues update-values
+                                                                                               :ConditionExpression "#rev = :oldrev"}}))]
+                                        (log/info :task :ddb-update-item :phase :end :ms (ms ddb-begin))
+                                        result))]
                   (cond (throttle? update-result)
                         (do
+                          (log/warn :task ::kp/-update-in :phase :ddb-throttle :ms (ms begin))
                           (async/<! (async/timeout backoff))
                           (recur (min 60000 (* 2 backoff))))
 
                         (condition-failed? update-result)
-                        (recur 100)
+                        (do
+                          (log/info :task ::kp/-update-in :phase :condition-failed :ms (ms begin))
+                          (recur 100))
 
                         (anomaly? update-result)
-                        (ex-info "failed to update DynamoDB" {:error update-result})
+                        (do
+                          (log/warn :task ::kp/-update-in :phase :error :error update-result :ms (ms begin))
+                          (ex-info "failed to update DynamoDB" {:error update-result}))
 
                         :else
-                        [(get-in value ks)
-                         (get-in new-value ks)])))
+                        (do
+                          (log/debug :task ::kp/-update-in :phase :end :ms (ms begin))
+                          [(get-in value ks)
+                           (get-in new-value ks)]))))
 
               (= :ops k1)
               (if (nil? k2)
                 (ex-info "must write a sub-key of :ops" {})
                 (loop [backoff 100]
-                  (let [result (async/<! (aws/invoke ddb-client {:op :GetItem
+                  (log/info :task :ddb-get-item :phase :begin :key {"k1" {:S "ops"} "k2" {:S (str k2)}})
+                  (let [ddb-begin (.instant *clock*)
+                        result (async/<! (aws/invoke ddb-client {:op :GetItem
                                                                  :request {:TableName table-name
                                                                            :Key {"k1" {:S "ops"}
                                                                                  "k2" {:S (str k2)}}
                                                                            :ConsistentRead true}}))]
+                    (log/info :task :ddb-get-item :phase :end :ms (ms ddb-begin))
                     (cond (throttle? result)
                           (do
+                            (log/warn :task ::kp/-update-in :phase :ddb-throttle :ms (ms begin))
                             (async/<! (async/timeout backoff))
                             (recur (min 60000 (* 2 backoff))))
 
@@ -320,41 +399,59 @@
                                                 (kp/-serialize serializer out write-handlers new-value)
                                                 (.toByteArray out))
                                 update-result (if (nil? rev)
-                                                (async/<! (aws/invoke ddb-client {:op :PutItem
-                                                                                  :request {:TableName table-name
-                                                                                            :Item {"k1" {:S "ops"}
-                                                                                                   "k2" {:S (str k2)}
-                                                                                                   "rev" {:N "0"}
-                                                                                                   "val" {:B encoded-value}}
-                                                                                            :ConditionExpression "attribute_not_exists(k1) AND attribute_not_exists(k2)"}}))
-                                                (async/<! (aws/invoke ddb-client {:op :UpdateItem
-                                                                                  :request {:TableName table-name
-                                                                                            :Key {"k1" {:S "ops"}
-                                                                                                  "k2" {:S (str k2)}}
-                                                                                            :UpdateExpression "SET #val = :val, #rev = #rev + 1"
-                                                                                            :ConditionExpression "#rev = :rev"
-                                                                                            :ExpressionAttributeNames {"#val" "val"
-                                                                                                                       "#rev" "rev"}
-                                                                                            :ExpressionAttributeValues {":val" {:B encoded-value}
-                                                                                                                        ":rev" {:N rev}}}})))]
+                                                (let [_ (log/info :task :ddb-put-item :phase :begin :key {"k1" {:S "ops"} "k2" {:S (str k2)}})
+                                                      ddb-begin (.instant *clock*)
+                                                      result (async/<! (aws/invoke ddb-client {:op :PutItem
+                                                                                               :request {:TableName table-name
+                                                                                                         :Item {"k1" {:S "ops"}
+                                                                                                                "k2" {:S (str k2)}
+                                                                                                                "rev" {:N "0"}
+                                                                                                                "val" {:B encoded-value}}
+                                                                                                         :ConditionExpression "attribute_not_exists(k1) AND attribute_not_exists(k2)"}}))]
+                                                  (log/info :task :ddb-put-item :phase :end :ms (ms ddb-begin))
+                                                  result)
+                                                (let [_ (log/info :task :ddb-update-item :phase :begin :key {"k1" {:S "ops"} "k2" {:S (str k2)}})
+                                                      ddb-begin (.instant *clock*)
+                                                      result (async/<! (aws/invoke ddb-client {:op :UpdateItem
+                                                                                               :request {:TableName table-name
+                                                                                                         :Key {"k1" {:S "ops"}
+                                                                                                               "k2" {:S (str k2)}}
+                                                                                                         :UpdateExpression "SET #val = :val, #rev = #rev + 1"
+                                                                                                         :ConditionExpression "#rev = :rev"
+                                                                                                         :ExpressionAttributeNames {"#val" "val"
+                                                                                                                                    "#rev" "rev"}
+                                                                                                         :ExpressionAttributeValues {":val" {:B encoded-value}
+                                                                                                                                     ":rev" {:N rev}}}}))]
+                                                  (log/info :task :ddb-update-item :phase :end :ms (ms ddb-begin))
+                                                  result))]
                             (cond (throttle? update-result)
                                   (do
+                                    (log/warn :task ::kp/-update-in :phase :ddb-throttle :ms (ms begin))
                                     (async/<! (async/timeout backoff))
                                     (recur (min 60000 (* 2 backoff))))
 
                                   (condition-failed? update-result)
-                                  (recur 100)
+                                  (do
+                                    (log/info :task ::kp/-update-in :phase :condition-failed :ms (ms begin))
+                                    (recur 100))
 
                                   (anomaly? update-result)
-                                  (ex-info "failed to update DynamoDB" {:error update-result})
+                                  (do
+                                    (log/warn :task ::kp/-update-in :phase :error :error update-result :ms (ms begin))
+                                    (ex-info "failed to update DynamoDB" {:error update-result}))
 
                                   :else
-                                  [(get-in value ks) (get-in new-value ks)]))))))
+                                  (do
+                                    (log/debug :task ::kp/-update-in :phase :end :ms (ms begin))
+                                    [(get-in value ks) (get-in new-value ks)])))))))
 
               :else
-              (let [value (let [result (async/<! (aws/invoke s3-client {:op :GetObject
+              (let [_ (log/info :task :s3-get-object :phase :begin :key k1)
+                    s3-begin (.instant *clock*)
+                    value (let [result (async/<! (aws/invoke s3-client {:op :GetObject
                                                                         :request {:Bucket bucket-name
                                                                                   :Key (str k1)}}))]
+                            (log/info :task :s3-get-object :phase :end :ms (ms s3-begin))
                             (cond (not-found? result) nil
                                   (anomaly? result) (throw (ex-info "failed to read S3" {:error result}))
                                   :else (kp/-deserialize serializer read-handlers (:Body result))))
@@ -364,22 +461,28 @@
                     encoded-value (let [out (ByteArrayOutputStream.)]
                                     (kp/-serialize serializer out write-handlers new-value)
                                     (.toByteArray out))
+                    _ (log/info :task :s3-put-object :phase :begin :key k1)
+                    s3-begin (.instant *clock*)
                     put-result (async/<! (aws/invoke s3-client {:op :PutObject
                                                                 :request {:Bucket bucket-name
                                                                           :Key (str k1)
                                                                           :Body encoded-value}}))]
+                (log/info :task :s3-put-object :phase :end :ms (ms s3-begin))
                 (cond (anomaly? put-result)
-                      (ex-info "failed to write to S3" {:error put-result})
-
-                      (nil? k2)
-                      [value new-value]
+                      (do
+                        (log/warn :task ::kp/-update-in :phase :error :error put-result :ms (ms begin))
+                        (ex-info "failed to write to S3" {:error put-result}))
 
                       :else
-                      [(get-in value (into [k2] ks))
-                       (get-in new-value (into [k2] ks))]))))))
+                      (do
+                        (log/debug :task ::kp/-update-in :phase :end :ms (ms begin))
+                        (if (nil? k2)
+                          [value new-value]
+                          [(get-in value (into [k2] ks))
+                           (get-in new-value (into [k2] ks))]))))))))
 
   (-assoc-in [this ks v]
-    (log/debug :task ::kp/-assoc-in :ks (pr-str ks) :v (pr-str v))
+    (log/debug :task ::kp/-assoc-in :ks (pr-str ks))
     (kp/-update-in this ks (constantly v)))
 
   (-dissoc [this k]
