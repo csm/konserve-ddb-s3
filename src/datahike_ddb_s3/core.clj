@@ -126,7 +126,7 @@
                              (recur es (assoc out k v))))
                          out)))]
       (log/debug :task ::get-db-value :phase :end :ms (ms begin))
-      {:value (when-not (empty? ddb-results) (get-in db-value ks))
+      {:value (when-not (empty? ddb-results) (get-in db-value (into [k] ks)))
        :rev   (-> ddb-results :Item :rev :N)})))
 
 (defrecord DynamoDB+S3Store [ddb-client s3-client table-name bucket-name serializer read-handlers write-handlers locks]
@@ -624,23 +624,11 @@
   * read-handlers -- An atom containing custom fressian read handlers.
   * write-handlers -- An atom containing custom fressian write handlers.
   * ddb-client -- An explicit DynamoDB client to use. Helpful for testing.
-  * s3-client -- An explicit S3 client to use. Helpful for testing.
-  * consistent-key -- A function of one argument that returns a truthy value
-    if that key should be stored consistently. Default accepts all keys as
-    consistent.
-
-  The consistent-key function is a way to instruct the store which top-level
-  keys must be atomic, and thus are stored across DynamoDB (for atomicity)
-  AND S3 (to store the data). If this function returns false for a given key,
-  it is assumed it does not need atomicity, and thus is only stored in S3.
-  This is helpful for when you have some keys that must be atomic, and others
-  that do not (for example, if a key is only ever written once, and then never
-  updated)."
-  [{:keys [region table bucket database serializer read-handlers write-handlers ddb-client s3-client consistent-key]
+  * s3-client -- An explicit S3 client to use. Helpful for testing."
+  [{:keys [region table bucket serializer read-handlers write-handlers ddb-client s3-client]
     :or   {serializer default-serializer
            read-handlers (atom {})
-           write-handlers (atom {})
-           consistent-key (constantly true)}}]
+           write-handlers (atom {})}}]
   (async/go
     (let [ddb-client (or ddb-client (aws-client/client {:api :dynamodb :region region}))
           s3-client (or s3-client (aws-client/client {:api :s3 :region region :http-client (-> ddb-client .-info :http-client)}))
