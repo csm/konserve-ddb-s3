@@ -170,18 +170,20 @@
         (is (false? (async/<!! (kp/-exists? store :rabbit))))
         (is (nil? (async/<!! (kp/-get-in store [:rabbit])))))
       (testing "that we can assoc values"
-        (is (= [nil {:long 42
-                     :decimal 3.14159M
-                     :string "some characters"
-                     :vector [:foo :bar :baz/test]
-                     :map {:x 10 :y 10}
-                     :set #{:foo :bar :baz}}]
-               (sv/<?? sv/S (kp/-assoc-in store [:data] {:long 42
-                                                         :decimal 3.14159M
-                                                         :string "some characters"
-                                                         :vector [:foo :bar :baz/test]
-                                                         :map {:x 10 :y 10}
-                                                         :set #{:foo :bar :baz}})))))
+
+        (is (nil? (sv/<?? sv/S (kp/-assoc-in store [:data] {:long 42
+                                                            :decimal 3.14159M
+                                                            :string "some characters"
+                                                            :vector [:foo :bar :baz/test]
+                                                            :map {:x 10 :y 10}
+                                                            :set #{:foo :bar :baz}}))))
+        (is (= {:long 42
+                :decimal 3.14159M
+                :string "some characters"
+                :vector [:foo :bar :baz/test]
+                :map {:x 10 :y 10}
+                :set #{:foo :bar :baz}}
+               (sv/<?? sv/S (kp/-get-in store [:data])))))
       (testing "that we cat get-in"
         (is (= 42 (sv/<?? sv/S (kp/-get-in store [:data :long]))))
         (is (= 3.14159M (sv/<?? sv/S (kp/-get-in store [:data :decimal]))))

@@ -169,7 +169,7 @@
                                                                        :Key             {"id" {:S ek}}
                                                                        :AttributesToGet ["val" "rev"]
                                                                        :ConsistentRead  true}}))]
-              (log/debug {:task :ddb-get-item :phase :end :key :ek :ms (ms clock begin)})
+              (log/debug {:task :ddb-get-item :phase :end :key ek :ms (ms clock begin)})
               (cond (throttle? response)
                     (do
                       (log/warn {:task :ddb-get-item :phase :throttled :backoff backoff})
@@ -180,8 +180,8 @@
                     (ex-info "failed to read DynamoDB" {:error response})
 
                     :else
-                    (let [value (some->> response :val :B (kp/-deserialize serializer read-handlers))
-                          rev (some-> response :rev :N (Long/parseLong))
+                    (let [value (some->> response :Item :val :B (kp/-deserialize serializer read-handlers))
+                          rev (some-> response :Item :rev :N (Long/parseLong))
                           new-value (if (empty? ks) (up-fn value) (update-in value ks up-fn))
                           new-rev (when rev (unchecked-inc rev))
                           begin (.instant clock)
@@ -205,7 +205,7 @@
                                                                                                 :ConditionExpression "attribute_exists(#id) AND #rev = :oldrev"
                                                                                                 :ExpressionAttributeNames {"#val" "val"
                                                                                                                            "#rev" "rev"
-                                                                                                                           "#id" "id"}
+                                                                                                                           "#id"  "id"}
                                                                                                 :ExpressionAttributeValues {":newval" {:B encoded-value}
                                                                                                                             ":oldrev" {:N (str rev)}
                                                                                                                             ":newrev" {:N (str new-rev)}}}}))]
