@@ -1,4 +1,4 @@
-(defproject com.github.csm/konserve-ddb-s3 "0.1.1-SNAPSHOT"
+(defproject com.github.csm/konserve-ddb-s3 "0.1.1"
   :description "Konserve store atop DynamoDB and S3"
   :url "https://github.com/csm/konserve-ddb-s3"
   :license {:name "MIT"
