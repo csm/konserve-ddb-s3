@@ -1,8 +1,8 @@
 (defproject com.github.csm/konserve-ddb-s3 "0.1.1-SNAPSHOT"
   :description "Konserve store atop DynamoDB and S3"
   :url "https://github.com/csm/konserve-ddb-s3"
-  :license {:name "EPL-2.0 OR GPL-2.0-or-later WITH Classpath-exception-2.0"
-            :url "https://www.eclipse.org/legal/epl-2.0/"}
+  :license {:name "MIT"
+            :url "https://opensource.org/licenses/MIT"}
   :dependencies [[org.clojure/clojure "1.10.1" :scope "provided"]
                  [io.replikativ/konserve "0.5.0" :exclusions [org.clojure/core.async]]
                  [com.cognitect.aws/api "0.8.352"]
