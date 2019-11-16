@@ -17,12 +17,14 @@
             [cognitect.aws.client.api.async :as aws]
             [konserve.protocols :as kp]
             [konserve.serializers :as ser]
+            [konserve-ddb-s3.b64 :as b64]
             [cognitect.aws.client.api :as aws-client]
             [clojure.tools.logging :as log]
             [superv.async :as sv]
-            [clojure.string :as string])
+            [clojure.string :as string]
+            [clojure.edn :as edn])
   (:import [java.io ByteArrayOutputStream ByteArrayInputStream Closeable DataOutputStream DataInputStream]
-           [java.util Base64 UUID]
+           [java.util Base64]
            [java.time Clock Duration]
            [net.jpountz.lz4 LZ4Factory]
            [com.google.common.io ByteStreams]))
@@ -47,10 +49,15 @@
   [result]
   (and (anomaly? result) (= ::anomalies/not-found (::anomalies/category result))))
 
-(defn- encode-key
-  "Encodes a key to URL-safe Base64."
+(defn encode-key
+  "Encodes a key to sortable URL-safe Base64."
   [prefix key]
-  (.encodeToString (Base64/getUrlEncoder) (.getBytes (pr-str [prefix key]) "UTF-8")))
+  (b64/b64-encode (.getBytes (pr-str [prefix key]) "UTF-8")))
+
+(defn decode-key
+  "Decode a key from sortable URL-safe base64."
+  [b]
+  (edn/read-string (String. (b64/b64-decode b) "UTF-8")))
 
 (defn- nano-clock
   ([] (nano-clock (Clock/systemUTC)))
@@ -68,6 +75,81 @@
       (.toNanos)
       (double)
       (/ 1000000.0)))
+
+(defn- ddb-keys
+  "Return a channel that yields all DynamoDB keys."
+  [ddb-client table-name dynamo-prefix start-key]
+  (let [ch (async/chan)
+        encoded-prefix (b64/b64-encode (.getBytes (str \[ (pr-str dynamo-prefix))))]
+    (async/go-loop [start-key start-key
+                    backoff 100]
+      (let [encoded-start-key (if (some? start-key)
+                                (encode-key dynamo-prefix start-key)
+                                encoded-prefix)
+            scan-results (async/<! (aws/invoke ddb-client {:op :Scan
+                                                           :request {:TableName table-name
+                                                                     :ExclusiveStartKey {"id" {:S encoded-start-key}}
+                                                                     :AttributesToGet ["id"]}}))]
+        (cond (throttle? scan-results)
+              (do
+                (async/<! (async/timeout backoff))
+                (recur start-key (min 60000 (* 2 backoff))))
+
+              (anomaly? scan-results)
+              (do
+                (async/>! ch (ex-info "failed to scan dynamodb table" {:error scan-results}))
+                (async/close! ch))
+
+              :else
+              (let [ks (->> (scan-results :Items)
+                            (map (comp :S :id))
+                            (filter #(string/starts-with? % encoded-prefix))
+                            (map decode-key))
+                    [last-prefix last-key] (loop [ks ks
+                                                  last-key nil]
+                                             (if-let [k (first ks)]
+                                               (when (async/>! ch (second k))
+                                                 (recur ks k))
+                                               last-key))]
+                (if (and (some? last-key)
+                         (some? (:LastEvaluatedKey scan-results))
+                         (= last-prefix dynamo-prefix))
+                  (recur last-key 100)
+                  (async/close! ch))))))
+    ch))
+
+(defn- s3-keys
+  [s3-client bucket-name s3-prefix start-key]
+  (let [ch (async/chan)
+        encoded-prefix (b64/b64-encode (.getBytes (str \[ s3-prefix)))]
+
+    (async/go-loop [encoded-prefix (if (some? start-key)
+                                     (encode-key s3-prefix start-key)
+                                     encoded-prefix)
+                    continuation-token nil]
+      (let [list-result (async/<! (aws/invoke s3-client {:op :ListObjectsV2
+                                                         :request {:Bucket bucket-name
+                                                                   :Prefix encoded-prefix
+                                                                   :ContinuationToken continuation-token}}))]
+        (if (anomaly? list-result)
+          (do
+            (async/>! ch (ex-info "failed to read s3" {:error list-result}))
+            (async/close! ch))
+          (let [ks (->> (:Contents list-result)
+                        (map :Key)
+                        (map decode-key))
+                [last-prefix last-key] (loop [ks ks
+                                              last-key nil]
+                                         (if-let [k (first ks)]
+                                           (when (async/>! ch (second k))
+                                             (recur (rest ks) k))
+                                           last-key))]
+            (if (and (some? last-key)
+                     (:IsTruncated list-result)
+                     (= s3-prefix last-prefix))
+              (recur nil (:ContinuationToken list-result))
+              (async/close! ch))))))
+    ch))
 
 (defrecord DDB+S3Store [ddb-client s3-client table-name bucket-name dynamo-prefix s3-prefix serializer read-handlers write-handlers consistent-key locks clock]
   kp/PEDNAsyncKeyValueStore
@@ -158,6 +240,9 @@
           (get-in value ks)))))
 
   (-update-in [this key-vec up-fn]
+    (kp/-update-in this key-vec up-fn []))
+
+  (-update-in [this key-vec up-fn args]
     (sv/go-try sv/S
       (let [[k & ks] key-vec]
         (if (consistent-key k)
@@ -182,7 +267,8 @@
                     :else
                     (let [value (some->> response :Item :val :B (kp/-deserialize serializer read-handlers))
                           rev (some-> response :Item :rev :N (Long/parseLong))
-                          new-value (if (empty? ks) (up-fn value) (update-in value ks up-fn))
+                          new-value (if (empty? ks) (apply up-fn value args)
+                                                    (update-in value ks #(apply up-fn % args)))
                           new-rev (when rev (unchecked-inc rev))
                           begin (.instant clock)
                           encoded-value (let [out (ByteArrayOutputStream.)]
@@ -230,8 +316,8 @@
           (let [ek (encode-key s3-prefix k)
                 current-value (sv/<? sv/S (kp/-get-in this [k]))
                 new-value (if (empty? ks)
-                            (up-fn current-value)
-                            (update-in current-value ks up-fn))
+                            (apply up-fn current-value args)
+                            (update-in current-value ks #(apply up-fn % args)))
                 encoded (let [out (ByteArrayOutputStream.)]
                           (kp/-serialize serializer out write-handlers new-value)
                           (.toByteArray out))
@@ -292,6 +378,52 @@
           (log/debug {:task :s3-delete-object :phase :end :key ek :ms (ms clock begin)})
           (when (s/valid? ::anomalies/anomaly response)
             (ex-info "failed to delete S3 value" {:error response}))))))
+
+  kp/PKeyIterable
+  (-keys [this] (kp/-keys this nil))
+
+  (-keys [_ start-key]
+    (let [ch (async/chan)
+          ddb-ch (ddb-keys ddb-client table-name dynamo-prefix start-key)
+          s3-ch (s3-keys s3-client bucket-name s3-prefix start-key)]
+      (async/go-loop [prev-ddb-key nil
+                      prev-s3-key nil
+                      ddb-closed? false
+                      s3-closed? false]
+        (let [ddb-value (or prev-ddb-key (when-not ddb-closed? (async/<! ddb-ch)))
+              s3-value (or prev-s3-key (when-not s3-closed? (async/<! s3-ch)))
+              ddb-closed? (nil? ddb-value)
+              s3-closed? (nil? s3-value)]
+          (cond (and (nil? ddb-value) (nil? s3-value))
+                (async/close! ch)
+
+                (nil? ddb-value)
+                (if (async/>! ch s3-value)
+                  (recur nil nil ddb-closed? s3-closed?)
+                  (do
+                    (async/close! ddb-ch)
+                    (async/close! s3-ch)))
+
+                (nil? s3-value)
+                (if (async/>! ch ddb-value)
+                  (recur nil nil ddb-closed? s3-closed?)
+                  (do
+                    (async/close! ddb-ch)
+                    (async/close! s3-ch)))
+
+                :else
+                (if (neg? (compare ddb-value s3-value))
+                  (if (async/>! ch ddb-value)
+                    (recur nil s3-value ddb-closed? s3-closed?)
+                    (do
+                      (async/close! ddb-ch)
+                      (async/close! s3-ch)))
+                  (if (async/>! ch s3-value)
+                    (recur ddb-value nil ddb-closed? s3-closed?)
+                    (do
+                      (async/close! ddb-ch)
+                      (async/close! s3-ch)))))))
+      ch))
 
   Closeable
   (close [_]
