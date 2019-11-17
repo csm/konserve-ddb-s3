@@ -15,7 +15,7 @@
                     :dependencies [[ch.qos.logback/logback-classic "1.1.8"]
                                    [ch.qos.logback/logback-core "1.1.8"]
                                    [io.replikativ/superv.async "0.2.9"]
-                                   [s4 "0.1.3" :exclusions [org.clojure/tools.logging]]
+                                   [s4 "0.1.10-SNAPSHOT" :exclusions [org.clojure/tools.logging]]
                                    [com.amazonaws/DynamoDBLocal "1.11.477"
                                     :exclusions [com.fasterxml.jackson.core/jackson-core
                                                  org.eclipse.jetty/jetty-client

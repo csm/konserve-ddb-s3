@@ -112,3 +112,41 @@
                                                              :key (:Key item)})))))))
         (when-let [t (:NextContinuationToken list-result)]
           (recur t))))))
+
+(require '[clojure.string :as string])
+
+(defn rename-s3-key
+  [k]
+  (let [[tag key] (k/decode-key k)]
+    (str (k/encode-key tag) \. (k/encode-key key))))
+
+(loop [continuation-token nil]
+  (let [list-result (aws/invoke s3-client {:op :ListObjectsV2
+                                           :request {:Bucket s3-bucket-name
+                                                     :Prefix "M"
+                                                     :ContinuationToken continuation-token}})]
+    (if (anomaly? list-result)
+      (throw (ex-info "failed to list S3" {:error list-result}))
+      (do
+        (doseq [item (->> (:Contents list-result)
+                          (map :Key)
+                          (remove #(string/includes? % ".")))]
+          (let [new-key (rename-s3-key item)
+                _ (println "copy" item "->" new-key)
+                copy-result (aws/invoke s3-client {:op :CopyObject
+                                                   :request {:Bucket s3-bucket-name
+                                                             :CopySource (str s3-bucket-name "/" item)
+                                                             :Key new-key}})]
+            (if (anomaly? copy-result)
+              (throw (ex-info "failed to copy object" {:error copy-result
+                                                       :key item
+                                                       :new-key new-key}))
+              (let [_ (println "delete" (:Key item))
+                    delete-result (aws/invoke s3-client {:op :DeleteObject
+                                                         :request {:Bucket s3-bucket-name
+                                                                   :Key item}})]
+                (when (anomaly? delete-result)
+                  (throw (ex-info "failed to delete object" {:error delete-result
+                                                             :key item})))))))
+        (when-let [t (:NextContinuationToken list-result)]
+          (recur t))))))

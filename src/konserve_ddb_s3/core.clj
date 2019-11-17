@@ -51,13 +51,35 @@
 
 (defn encode-key
   "Encodes a key to sortable URL-safe Base64."
-  [prefix key]
-  (b64/b64-encode (.getBytes (pr-str [prefix key]) "UTF-8")))
+  [key]
+  (b64/b64-encode (.getBytes (pr-str key) "UTF-8")))
 
 (defn decode-key
   "Decode a key from sortable URL-safe base64."
   [b]
   (edn/read-string (String. (b64/b64-decode b) "UTF-8")))
+
+(defn encode-s3-key
+  [prefix key]
+  (str (encode-key prefix) \. (encode-key key)))
+
+(defn decode-s3-key
+  [k]
+  (map decode-key (string/split k #"\.")))
+
+(defn key-compare
+  "TODO key sorting should be common across all backends."
+  [k1 k2]
+  (if (nil? k1)
+    (if (nil? k2)
+      0
+      -1)
+    (if (nil? k2)
+      1
+      (let [tc (compare (.getName (type k1)) (.getName (type k2)))]
+        (cond (neg? tc) -1
+              (pos? tc) 1
+              :else (compare k1 k2))))))
 
 (defn- nano-clock
   ([] (nano-clock (Clock/systemUTC)))
@@ -80,16 +102,20 @@
   "Return a channel that yields all DynamoDB keys."
   [ddb-client table-name dynamo-prefix start-key]
   (let [ch (async/chan)
-        encoded-prefix (b64/b64-encode (.getBytes (str \[ (pr-str dynamo-prefix))))]
+        encoded-prefix (encode-key dynamo-prefix)]
     (async/go-loop [start-key start-key
                     backoff 100]
-      (let [encoded-start-key (if (some? start-key)
-                                (encode-key dynamo-prefix start-key)
-                                encoded-prefix)
+      (let [ex-start-key (if (some? start-key)
+                           {"tag" {:S encoded-prefix}
+                            "key" {:S (encode-key start-key)}}
+                           {"tag" {:S encoded-prefix}
+                            "key" {:S "-"}}) ; minimal value in base-64 encoding
             scan-results (async/<! (aws/invoke ddb-client {:op :Scan
                                                            :request {:TableName table-name
-                                                                     :ExclusiveStartKey {"id" {:S encoded-start-key}}
-                                                                     :AttributesToGet ["id"]}}))]
+                                                                     :ExclusiveStartKey ex-start-key
+                                                                     :ScanFilter {"tag" {:AttributeValueList [{:S encoded-prefix}]
+                                                                                         :ComparisonOperator "EQ"}}
+                                                                     :AttributesToGet ["key"]}}))]
         (cond (throttle? scan-results)
               (do
                 (async/<! (async/timeout backoff))
@@ -102,18 +128,17 @@
 
               :else
               (let [ks (->> (scan-results :Items)
-                            (map (comp :S :id))
-                            (filter #(string/starts-with? % encoded-prefix))
+                            (map (comp :S :key))
                             (map decode-key))
-                    [last-prefix last-key] (loop [ks ks
-                                                  last-key nil]
-                                             (if-let [k (first ks)]
-                                               (when (async/>! ch (second k))
-                                                 (recur ks k))
-                                               last-key))]
+                    last-key (loop [ks ks
+                                    last-key nil]
+                               (if-let [k (first ks)]
+                                 (when (async/>! ch k)
+                                   (recur (rest ks) k))
+                                 last-key))]
                 (if (and (some? last-key)
                          (some? (:LastEvaluatedKey scan-results))
-                         (= last-prefix dynamo-prefix))
+                         (= (-> scan-results :LastEvaluatedKey :tag :S) encoded-prefix))
                   (recur last-key 100)
                   (async/close! ch))))))
     ch))
@@ -121,33 +146,36 @@
 (defn- s3-keys
   [s3-client bucket-name s3-prefix start-key]
   (let [ch (async/chan)
-        encoded-prefix (b64/b64-encode (.getBytes (str \[ s3-prefix)))]
-
+        encoded-prefix (str (encode-key s3-prefix) \.)]
     (async/go-loop [encoded-prefix (if (some? start-key)
-                                     (encode-key s3-prefix start-key)
+                                     (encode-s3-key s3-prefix start-key)
                                      encoded-prefix)
                     continuation-token nil]
+      (log/debug "scanning s3 prefix:" encoded-prefix "continuation token:" continuation-token)
       (let [list-result (async/<! (aws/invoke s3-client {:op :ListObjectsV2
                                                          :request {:Bucket bucket-name
                                                                    :Prefix encoded-prefix
                                                                    :ContinuationToken continuation-token}}))]
+        (log/debug "list result:" (dissoc list-result :Contents))
         (if (anomaly? list-result)
           (do
             (async/>! ch (ex-info "failed to read s3" {:error list-result}))
             (async/close! ch))
           (let [ks (->> (:Contents list-result)
                         (map :Key)
-                        (map decode-key))
+                        (map decode-s3-key))
                 [last-prefix last-key] (loop [ks ks
                                               last-key nil]
                                          (if-let [k (first ks)]
                                            (when (async/>! ch (second k))
+                                             (log/debug "put" k "remaining:" (count (rest ks)))
                                              (recur (rest ks) k))
                                            last-key))]
+            (log/debug "last-prefix:" last-prefix "last-key:" last-key)
             (if (and (some? last-key)
                      (:IsTruncated list-result)
                      (= s3-prefix last-prefix))
-              (recur nil (:ContinuationToken list-result))
+              (recur encoded-prefix (:NextContinuationToken list-result))
               (async/close! ch))))))
     ch))
 
@@ -159,13 +187,14 @@
         (if (consistent-key key)
           (loop [backoff 100]
             (let [begin (.instant clock)
-                  ek (encode-key dynamo-prefix key)
+                  ddb-key {"tag" {:S (encode-key dynamo-prefix)}
+                           "key" {:S (encode-key key)}}
                   response (async/<! (aws/invoke ddb-client {:op      :GetItem
                                                              :request {:TableName       table-name
-                                                                       :Key             {"id" {:S ek}}
-                                                                       :AttributesToGet ["val"]
+                                                                       :Key             ddb-key
+                                                                       :AttributesToGet ["key"]
                                                                        :ConsistentRead  true}}))]
-              (log/debug {:task :ddb-get-item :phase :end :key ek :ms (ms clock begin)})
+              (log/debug {:task :ddb-get-item :phase :end :key ddb-key :ms (ms clock begin)})
               (cond
                 (throttle? response)
                 (do
@@ -178,7 +207,7 @@
 
                 :else
                 (not (empty? response)))))
-          (let [ek (encode-key s3-prefix key)
+          (let [ek (encode-s3-key s3-prefix key)
                 response (async/<! (aws/invoke s3-client {:op :HeadObject
                                                           :request {:Bucket bucket-name
                                                                     :Key ek}}))]
@@ -199,13 +228,14 @@
             value (if consistent?
                     (loop [backoff 100]
                       (let [begin (.instant clock)
-                            ek (encode-key dynamo-prefix k)
+                            ddb-key {"tag" {:S (encode-key dynamo-prefix)}
+                                     "key" {:S (encode-key k)}}
                             response (async/<! (aws/invoke ddb-client {:op      :GetItem
                                                                        :request {:TableName       table-name
-                                                                                 :Key             {"id" {:S ek}}
+                                                                                 :Key             ddb-key
                                                                                  :AttributesToGet ["val"]
                                                                                  :ConsistentRead  true}}))]
-                        (log/debug {:task :ddb-get-item :phase :end :key ek :ms (ms clock begin)})
+                        (log/debug {:task :ddb-get-item :phase :end :key ddb-key :ms (ms clock begin)})
                         (cond (empty? response) nil
 
                               (throttle? response)
@@ -219,7 +249,7 @@
 
                               :else
                               (kp/-deserialize serializer read-handlers (-> response :Item :val :B)))))
-                    (let [s3k (encode-key s3-prefix k)
+                    (let [s3k (encode-s3-key s3-prefix k)
                           begin (.instant clock)
                           response (async/<! (aws/invoke s3-client {:op :GetObject
                                                                     :request {:Bucket bucket-name
@@ -248,13 +278,14 @@
         (if (consistent-key k)
           (loop [backoff 100]
             (let [begin (.instant clock)
-                  ek (encode-key dynamo-prefix k)
+                  ddb-key {"tag" {:S (encode-key dynamo-prefix)}
+                           "key" {:S (encode-key k)}}
                   response (async/<! (aws/invoke ddb-client {:op :GetItem
                                                              :request {:TableName       table-name
-                                                                       :Key             {"id" {:S ek}}
+                                                                       :Key             ddb-key
                                                                        :AttributesToGet ["val" "rev"]
                                                                        :ConsistentRead  true}}))]
-              (log/debug {:task :ddb-get-item :phase :end :key ek :ms (ms clock begin)})
+              (log/debug {:task :ddb-get-item :phase :end :key ddb-key :ms (ms clock begin)})
               (cond (throttle? response)
                     (do
                       (log/warn {:task :ddb-get-item :phase :throttled :backoff backoff})
@@ -277,25 +308,26 @@
                           update-response (if (nil? rev)
                                             (let [r (async/<! (aws/invoke ddb-client {:op :PutItem
                                                                                       :request {:TableName table-name
-                                                                                                :Item {"id"  {:S ek}
-                                                                                                       "val" {:B encoded-value}
-                                                                                                       "rev" {:N "0"}}
-                                                                                                :ConditionExpression "attribute_not_exists(#id)"
-                                                                                                :ExpressionAttributeNames {"#id" "id"}}}))]
-                                              (log/debug {:task :ddb-put-item :phase :end :key ek :ms (ms clock begin)})
+                                                                                                :Item (assoc ddb-key
+                                                                                                             "val" {:B encoded-value}
+                                                                                                             "rev" {:N "0"})
+                                                                                                :ConditionExpression "attribute_not_exists(#tag) AND attribute_not_exists(#key)"
+                                                                                                :ExpressionAttributeNames {"#tag" "tag" "#key" "key"}}}))]
+                                              (log/debug {:task :ddb-put-item :phase :end :key ddb-key :ms (ms clock begin)})
                                               r)
                                             (let [r (async/<! (aws/invoke ddb-client {:op :UpdateItem
                                                                                       :request {:TableName table-name
-                                                                                                :Key {"id" {:S ek}}
+                                                                                                :Key ddb-key
                                                                                                 :UpdateExpression "SET #val = :newval, #rev = :newrev"
-                                                                                                :ConditionExpression "attribute_exists(#id) AND #rev = :oldrev"
+                                                                                                :ConditionExpression "attribute_exists(#tag) AND attribute_exists(#key) AND #rev = :oldrev"
                                                                                                 :ExpressionAttributeNames {"#val" "val"
                                                                                                                            "#rev" "rev"
-                                                                                                                           "#id"  "id"}
+                                                                                                                           "#tag" "tag"
+                                                                                                                           "#key" "key"}
                                                                                                 :ExpressionAttributeValues {":newval" {:B encoded-value}
                                                                                                                             ":oldrev" {:N (str rev)}
                                                                                                                             ":newrev" {:N (str new-rev)}}}}))]
-                                              (log/debug {:task :ddb-update-item :phase :end :key ek :ms (ms clock begin)})
+                                              (log/debug {:task :ddb-update-item :phase :end :key ddb-key :ms (ms clock begin)})
                                               r))]
                       (cond (throttle? update-response)
                             (do
@@ -313,7 +345,7 @@
 
                             :else
                             [(get-in value ks) (get-in new-value ks)])))))
-          (let [ek (encode-key s3-prefix k)
+          (let [ek (encode-s3-key s3-prefix k)
                 current-value (sv/<? sv/S (kp/-get-in this [k]))
                 new-value (if (empty? ks)
                             (apply up-fn current-value args)
@@ -340,7 +372,7 @@
           (let [encoded (let [out (ByteArrayOutputStream.)]
                           (kp/-serialize serializer out write-handlers val)
                           (.toByteArray out))
-                ek (encode-key s3-prefix k)
+                ek (encode-s3-key s3-prefix k)
                 begin (.instant clock)
                 response (async/<! (aws/invoke s3-client {:op :PutObject
                                                           :request {:Bucket bucket-name
@@ -354,12 +386,13 @@
     (async/go
       (if (consistent-key key)
         (loop [backoff 100]
-          (let [ek (encode-key dynamo-prefix key)
+          (let [ddb-key {"tag" {:S (encode-key dynamo-prefix)}
+                         "key" {:S (encode-key key)}}
                 begin (.instant clock)
                 response (async/<! (aws/invoke ddb-client {:op :DeleteItem
                                                            :request {:TableName table-name
-                                                                     :Key       {"id" {:S ek}}}}))]
-            (log/debug {:task :ddb-delete-item :phase :end :key ek :ms (ms clock begin)})
+                                                                     :Key       ddb-key}}))]
+            (log/debug {:task :ddb-delete-item :phase :end :key ddb-key :ms (ms clock begin)})
             (cond (throttle? response)
                   (do
                     (log/warn {:task :ddb-delete-item :phase :throttled :backoff backoff})
@@ -371,7 +404,7 @@
 
                   :else nil)))
         (let [begin (.instant clock)
-              ek (encode-key s3-prefix key)
+              ek (encode-s3-key s3-prefix key)
               response (async/<! (aws/invoke s3-client {:op :DeleteObject
                                                         :request {:Bucket bucket-name
                                                                   :Key ek}}))]
@@ -380,8 +413,6 @@
             (ex-info "failed to delete S3 value" {:error response}))))))
 
   kp/PKeyIterable
-  (-keys [this] (kp/-keys this nil))
-
   (-keys [_ start-key]
     (let [ch (async/chan)
           ddb-ch (ddb-keys ddb-client table-name dynamo-prefix start-key)
@@ -412,7 +443,7 @@
                     (async/close! s3-ch)))
 
                 :else
-                (if (neg? (compare ddb-value s3-value))
+                (if (neg? (key-compare ddb-value s3-value))
                   (if (async/>! ch ddb-value)
                     (recur nil s3-value ddb-closed? s3-closed?)
                     (do
@@ -505,14 +536,22 @@
           table-ok (if (s/valid? ::anomalies/anomaly table-exists)
                      (async/<! (aws/invoke ddb-client {:op :CreateTable
                                                        :request {:TableName table
-                                                                 :AttributeDefinitions [{:AttributeName "id"
+                                                                 :AttributeDefinitions [{:AttributeName "tag"
+                                                                                         :AttributeType "S"}
+                                                                                        {:AttributeName "key"
                                                                                          :AttributeType "S"}]
-                                                                 :KeySchema [{:AttributeName "id"
-                                                                              :KeyType "HASH"}]
+                                                                 :KeySchema [{:AttributeName "tag"
+                                                                              :KeyType "HASH"}
+                                                                             {:AttributeName "key"
+                                                                              :KeyType "RANGE"}]
                                                                  :ProvisionedThroughput {:ReadCapacityUnits read-throughput
                                                                                          :WriteCapacityUnits write-throughput}}}))
-                     (if (and (= [{:AttributeName "id" :AttributeType "S"}] (-> table-exists :Table :AttributeDefinitions))
-                              (= [{:AttributeName "id" :KeyType "HASH"}] (-> table-exists :Table :KeySchema)))
+                     (if (and (= #{{:AttributeName "tag" :AttributeType "S"}
+                                   {:AttributeName "key" :AttributeType "S"}}
+                                 (-> table-exists :Table :AttributeDefinitions set))
+                              (= #{{:AttributeName "tag" :KeyType "HASH"}
+                                   {:AttributeName "key" :KeyType "RANGE"}}
+                                 (-> table-exists :Table :KeySchema set)))
                        :ok
                        {::anomalies/category ::anomalies/incorrect
                         ::anomalies/message "table exists but has different attribute definitions or key schema than expected"}))]
@@ -574,8 +613,12 @@
           table-ok (async/<! (aws/invoke ddb-client {:op :DescribeTable :request {:TableName table}}))
           table-ok (if (s/valid? ::anomalies/anomaly table-ok)
                      table-ok
-                     (when-not (and (= [{:AttributeName "id" :AttributeType "S"}] (-> table-ok :Table :AttributeDefinitions))
-                                    (= [{:AttributeName "id" :KeyType "HASH"}] (-> table-ok :Table :KeySchema)))
+                     (when-not (and (= #{{:AttributeName "tag" :AttributeType "S"}
+                                         {:AttributeName "key" :AttributeType "S"}}
+                                       (-> table-ok :Table :AttributeDefinitions set))
+                                    (= #{{:AttributeName "tag" :KeyType "HASH"}
+                                         {:AttributeName "key" :KeyType "RANGE"}}
+                                       (-> table-ok :Table :KeySchema set)))
                        {::anomalies/category ::anomalies/incorrect
                         ::anomalies/message "table has invalid attribute definitions or key schema"}))]
       (if (s/valid? ::anomalies/anomaly table-ok)

@@ -4,7 +4,7 @@
             [clojure.string :as string])
   (:import [java.util Base64]))
 
-(def ^:private b64-dec
+(def b64-dec
   {\- \=,
    \0 \A,
    \1 \B,
