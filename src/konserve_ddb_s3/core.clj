@@ -67,20 +67,6 @@
   [k]
   (map decode-key (string/split k #"\.")))
 
-(defn key-compare
-  "TODO key sorting should be common across all backends."
-  [k1 k2]
-  (if (nil? k1)
-    (if (nil? k2)
-      0
-      -1)
-    (if (nil? k2)
-      1
-      (let [tc (compare (.getName (type k1)) (.getName (type k2)))]
-        (cond (neg? tc) -1
-              (pos? tc) 1
-              :else (compare k1 k2))))))
-
 (defn- nano-clock
   ([] (nano-clock (Clock/systemUTC)))
   ([clock]
@@ -413,48 +399,9 @@
             (ex-info "failed to delete S3 value" {:error response}))))))
 
   kp/PKeyIterable
-  (-keys [_ start-key]
-    (let [ch (async/chan)
-          ddb-ch (ddb-keys ddb-client table-name dynamo-prefix start-key)
-          s3-ch (s3-keys s3-client bucket-name s3-prefix start-key)]
-      (async/go-loop [prev-ddb-key nil
-                      prev-s3-key nil
-                      ddb-closed? false
-                      s3-closed? false]
-        (let [ddb-value (or prev-ddb-key (when-not ddb-closed? (async/<! ddb-ch)))
-              s3-value (or prev-s3-key (when-not s3-closed? (async/<! s3-ch)))
-              ddb-closed? (nil? ddb-value)
-              s3-closed? (nil? s3-value)]
-          (cond (and (nil? ddb-value) (nil? s3-value))
-                (async/close! ch)
-
-                (nil? ddb-value)
-                (if (async/>! ch s3-value)
-                  (recur nil nil ddb-closed? s3-closed?)
-                  (do
-                    (async/close! ddb-ch)
-                    (async/close! s3-ch)))
-
-                (nil? s3-value)
-                (if (async/>! ch ddb-value)
-                  (recur nil nil ddb-closed? s3-closed?)
-                  (do
-                    (async/close! ddb-ch)
-                    (async/close! s3-ch)))
-
-                :else
-                (if (neg? (key-compare ddb-value s3-value))
-                  (if (async/>! ch ddb-value)
-                    (recur nil s3-value ddb-closed? s3-closed?)
-                    (do
-                      (async/close! ddb-ch)
-                      (async/close! s3-ch)))
-                  (if (async/>! ch s3-value)
-                    (recur ddb-value nil ddb-closed? s3-closed?)
-                    (do
-                      (async/close! ddb-ch)
-                      (async/close! s3-ch)))))))
-      ch))
+  (-keys [_]
+    (async/merge [(ddb-keys ddb-client table-name dynamo-prefix nil)
+                  (s3-keys s3-client bucket-name s3-prefix nil)]))
 
   Closeable
   (close [_]
