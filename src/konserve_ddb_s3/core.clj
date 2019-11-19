@@ -520,22 +520,22 @@
             (->DDB+S3Store ddb-client s3-client table bucket database database serializer read-handlers write-handlers consistent-key (atom {}) (nano-clock))))))))
 
 (defn delete-store
-  [{:keys [region table bucket database serializer read-handlers write-handlers ddb-client s3-client consistent-key]
-    :or   {serializer default-serializer
-           read-handlers (atom {})
-           write-handlers (atom {})
-           consistent-key (constantly true)}}]
+  [{:keys [region table bucket database ddb-client s3-client]}]
   (sv/go-try sv/S
     (let [ddb-client (or ddb-client (aws-client/client {:api :dynamodb :region region}))
-          s3-client (or s3-client (aws-client/client {:api :s3 :region region :http-client (-> ddb-client .-info :http-client)}))]
+          s3-client (or s3-client (aws-client/client {:api :s3 :region region :http-client (-> ddb-client .-info :http-client)}))
+          clock (nano-clock)]
       (loop [backoff 100
              start-key nil]
-        (let [items (async/<! (aws/invoke ddb-client {:op :Scan
+        (log/debug :task :ddb-scan :phase :begin)
+        (let [begin (.instant clock)
+              items (async/<! (aws/invoke ddb-client {:op :Scan
                                                       :request {:TableName table
                                                                 :ScanFilter {"tag" {:AttributeValueList [{:S (encode-key database)}]
                                                                                     :ComparisonOperator "EQ"}}
                                                                 :ExclusiveStartKey start-key
                                                                 :AttributesToGet ["tag" "key"]}}))]
+          (log/debug :task :ddb-scan :phase :end :ms (ms clock begin))
           (cond (throttle? items)
                 (do
                   (log/warn :task ::delete-store :phase :throttled :backoff backoff)
@@ -550,10 +550,13 @@
                   (loop [backoff 100
                          items (:Items items)]
                     (when-let [item (first items)]
-                      (let [delete (async/<! (aws/invoke ddb-client {:op :DeleteItem
+                      (log/debug :task :ddb-delete-item :key item :phase :begin)
+                      (let [begin (.instant clock)
+                            delete (async/<! (aws/invoke ddb-client {:op :DeleteItem
                                                                      :request {:TableName table
                                                                                :Key {"tag" (:tag item)
                                                                                      "key" (:key item)}}}))]
+                        (log/debug :task :ddb-delete-item :phase :end :ms (ms clock begin))
                         (cond (throttle? delete)
                               (do
                                 (log/warn :task ::delete-store :phase :throttled :backoff backoff)
@@ -568,19 +571,25 @@
                   (when-let [k (:LastEvaluatedKey items)]
                     (recur 100 k))))))
       (loop [continuation-token nil]
+        (log/debug :task :s3-list-objects :phase :begin)
         (let [prefix (str (encode-key database) \.)
+              begin (.instant clock)
               list (async/<! (aws/invoke s3-client {:op :ListObjectsV2
                                                     :request {:Bucket bucket
                                                               :Prefix prefix
                                                               :ContinuationToken continuation-token}}))]
+          (log/debug :task :s3-list-objects :phase :end :ms (ms clock begin))
           (if (anomaly? list)
             (throw (ex-info "failed to list S3 objects" {:error list}))
             (do
               (loop [objects (:Contents list)]
                 (when-let [object (first objects)]
-                  (let [delete (async/<! (aws/invoke s3-client {:op :DeleteObject
+                  (log/debug :task :s3-delete-object :key (:Key object) :phase :begin)
+                  (let [begin (.instant clock)
+                        delete (async/<! (aws/invoke s3-client {:op :DeleteObject
                                                                 :request {:Bucket bucket
                                                                           :Key (:Key object)}}))]
+                    (log/debug :task :s3-delete-object :phase :end :ms (ms clock begin))
                     (when (anomaly? delete)
                       (throw (ex-info "failed to delete S3 object" {:error delete}))))
                   (recur (rest objects))))
