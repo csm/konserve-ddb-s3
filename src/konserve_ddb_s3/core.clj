@@ -520,8 +520,72 @@
             (->DDB+S3Store ddb-client s3-client table bucket database database serializer read-handlers write-handlers consistent-key (atom {}) (nano-clock))))))))
 
 (defn delete-store
-  [config]
-  (async/go (ex-info "not yet implemented" {})))
+  [{:keys [region table bucket database serializer read-handlers write-handlers ddb-client s3-client consistent-key]
+    :or   {serializer default-serializer
+           read-handlers (atom {})
+           write-handlers (atom {})
+           consistent-key (constantly true)}}]
+  (sv/go-try sv/S
+    (let [ddb-client (or ddb-client (aws-client/client {:api :dynamodb :region region}))
+          s3-client (or s3-client (aws-client/client {:api :s3 :region region :http-client (-> ddb-client .-info :http-client)}))]
+      (loop [backoff 100
+             start-key nil]
+        (let [items (async/<! (aws/invoke ddb-client {:op :Scan
+                                                      :request {:TableName table
+                                                                :ScanFilter {"tag" {:AttributeValueList [{:S (encode-key database)}]
+                                                                                    :ComparisonOperator "EQ"}}
+                                                                :ExclusiveStartKey start-key
+                                                                :AttributesToGet ["tag" "key"]}}))]
+          (cond (throttle? items)
+                (do
+                  (log/warn :task ::delete-store :phase :throttled :backoff backoff)
+                  (async/<! (async/timeout backoff))
+                  (recur (min 60000 (* 2 backoff)) start-key))
+
+                (anomaly? items)
+                (throw (ex-info "failed to scan dynamodb" {:error items}))
+
+                :else
+                (do
+                  (loop [backoff 100
+                         items (:Items items)]
+                    (when-let [item (first items)]
+                      (let [delete (async/<! (aws/invoke ddb-client {:op :DeleteItem
+                                                                     :request {:TableName table
+                                                                               :Key {"tag" (:tag item)
+                                                                                     "key" (:key item)}}}))]
+                        (cond (throttle? delete)
+                              (do
+                                (log/warn :task ::delete-store :phase :throttled :backoff backoff)
+                                (async/<! (async/timeout backoff))
+                                (recur (min 60000 (* 2 backoff)) items))
+
+                              (anomaly? delete)
+                              (throw (ex-info "failed to delete dynamodb item" {:error delete}))
+
+                              :else
+                              (recur 100 (rest items))))))
+                  (when-let [k (:LastEvaluatedKey items)]
+                    (recur 100 k))))))
+      (loop [continuation-token nil]
+        (let [prefix (str (encode-key database) \.)
+              list (async/<! (aws/invoke s3-client {:op :ListObjectsV2
+                                                    :request {:Bucket bucket
+                                                              :Prefix prefix
+                                                              :ContinuationToken continuation-token}}))]
+          (if (anomaly? list)
+            (throw (ex-info "failed to list S3 objects" {:error list}))
+            (do
+              (loop [objects (:Contents list)]
+                (when-let [object (first objects)]
+                  (let [delete (async/<! (aws/invoke s3-client {:op :DeleteObject
+                                                                :request {:Bucket bucket
+                                                                          :Key (:Key object)}}))]
+                    (when (anomaly? delete)
+                      (throw (ex-info "failed to delete S3 object" {:error delete}))))
+                  (recur (rest objects))))
+              (when (:IsTruncated list)
+                (recur (:NextContinuationToken list))))))))))
 
 (defn connect-store
   "Connect to an existing store on DynamoDB and S3.
