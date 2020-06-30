@@ -520,10 +520,10 @@
 
                                      :else :ok))))
                        table-exists)
-                     (if (and (= attrib-defs
-                                 (-> ^DescribeTableResponse table-exists (.table) (.attributeDefinitions)))
-                              (= key-schema
-                                 (-> ^DescribeTableResponse table-exists (.table) (.keySchema))))
+                     (if (and (= (set attrib-defs)
+                                 (-> ^DescribeTableResponse table-exists (.table) (.attributeDefinitions) (set)))
+                              (= (set key-schema)
+                                 (-> ^DescribeTableResponse table-exists (.table) (.keySchema) (set))))
                        :ok
                        (ex-info "table exists but has an incompatible schema" {:table-name table})))]
       (if (instance? Throwable table-ok)
