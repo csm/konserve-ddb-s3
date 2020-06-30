@@ -674,10 +674,10 @@
                                                             (.build))))
           table-ok (if (instance? Throwable table-ok)
                      table-ok
-                     (when-not (and (= attrib-defs
-                                       (-> table-ok (.table) (.attributeDefinitions)))
-                                    (= key-schema
-                                       (-> table-ok (.table) (.keySchema))))
+                     (when-not (and (= (set attrib-defs)
+                                       (-> table-ok (.table) (.attributeDefinitions) (set)))
+                                    (= (set key-schema)
+                                       (-> table-ok (.table) (.keySchema) (set))))
                        (ex-info "table exists but has invalid schema" {:table-name table})))]
       (if (instance? Throwable table-ok)
         table-ok
